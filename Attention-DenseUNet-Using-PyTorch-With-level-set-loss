@@ -1,0 +1,454 @@
+# Standard Library Imports
+import os
+import random
+from zipfile import ZipFile
+from glob import glob
+
+# External Imports
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import segmentation_models_pytorch as smp
+from PIL import Image
+from matplotlib import pyplot as plt
+from sklearn.model_selection import train_test_split
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, StepLR, MultiStepLR, CyclicLR
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms as T, datasets as dset
+
+# Ensure Reproducibility
+seed = 44
+random.seed(seed)
+torch.manual_seed(seed)
+
+# Configuration
+config = {
+    "batch_size": 4,
+    "epochs": 10,
+    "learning_rate": 0.0002,
+    "n_workers": 2,
+    "img_dimensions": (256, 256, 3),
+    "device": torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+}
+
+# Data Extraction
+def extract_data(zip_path, extract_path):
+    with ZipFile(zip_path, 'r') as zf:
+        zf.extractall(extract_path)
+
+extract_data('../input/carvana-image-masking-challenge/train.zip', '../working')
+extract_data('../input/carvana-image-masking-challenge/train_masks.zip', '../working')
+
+# Custom Dataset
+class CarvanaDataset(Dataset):
+    def __init__(self, root_dir: str, train=True, transforms=None):
+        self.train = train
+        self.transforms = transforms
+        self.images = sorted(glob(root_dir + 'train/*.*'))
+        self.image_mask = sorted(glob(root_dir + 'train_masks/*.*'))
+        split_ratio = int(len(self.images) * 0.7) # manual train/validation split
+        if train:
+            self.images = self.images[:split_ratio]
+            self.image_mask = self.image_mask[:split_ratio]
+        else:
+            self.images = self.images[split_ratio:]
+            self.image_mask = self.image_mask[split_ratio:]
+        
+    def __getitem__(self, index: int):
+        image = Image.open(self.images[index]).convert('RGB')
+        image_mask = Image.open(self.image_mask[index]).convert('L')
+        if self.transforms:
+            image = self.transforms(image)
+            image_mask = self.transforms(image_mask)            
+        return {'img': image, 'mask': image_mask}
+    
+    def __len__(self):
+        return len(self.images)
+
+# Data Transforms
+transforms = T.Compose([
+    T.Resize(config["img_dimensions"][:2]),
+    T.ToTensor(),
+])
+
+# Data Loaders
+def get_data_loader(dataset, shuffle=True):
+    return DataLoader(
+        dataset=dataset,
+        batch_size=config["batch_size"],
+        shuffle=shuffle,
+        num_workers=config["n_workers"]
+    )
+
+train_dataset = CarvanaDataset(root_dir='../working/', train=True, transforms=transforms)
+val_dataset = CarvanaDataset(root_dir='../working/', train=False, transforms=transforms)
+train_dataset_loader = get_data_loader(train_dataset)
+val_dataset_loader = get_data_loader(val_dataset)
+
+# Sample Data Visualization
+samples = next(iter(train_dataset_loader))
+
+fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1, figsize=(12, 4))
+fig.tight_layout()
+
+def visualize_sample(ax, title, img, cmap=None):
+    ax.axis('off')
+    ax.set_title(title)
+    ax.imshow(np.transpose(vutils.make_grid(img, padding=2).numpy(),(1, 2, 0)), cmap=cmap)
+
+visualize_sample(ax1, 'input image', samples['img'])
+visualize_sample(ax2, 'input mask', samples['mask'], cmap='gray')
+plt.show()
+
+
+# Define Netowrk Model
+import numpy as np
+import torch
+import torch.nn as nn
+
+
+class Attention_block(nn.Module):
+    def __init__(self, F_g, F_l, F_int):
+        super(Attention_block, self).__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+
+        return x * psi
+
+
+class DenseConvBlock(nn.Module):
+    def __init__(self, ch_in, ch_out, num_layers=2):
+        super(DenseConvBlock, self).__init__()
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList()
+
+        for i in range(num_layers):
+            self.layers.append(nn.Sequential(
+                nn.Conv2d(ch_in + i * ch_out, ch_out, kernel_size=3, stride=1, padding=1, bias=True),
+                nn.BatchNorm2d(ch_out),
+                nn.ReLU(inplace=True)
+            ))
+
+    def forward(self, x):
+        outputs = [x]
+        for i in range(self.num_layers):
+            out = self.layers[i](torch.cat(outputs, dim=1))
+            outputs.append(out)
+        return outputs[-1]  # 返回最后一层的输出，而不是将所有输出连接在一起
+
+
+
+class up_conv(nn.Module):
+    def __init__(self, ch_in, ch_out):
+        super(up_conv, self).__init__()
+        self.up = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(ch_in, ch_out, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(ch_out),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.up(x)
+
+
+class AttentionDenseUNet(nn.Module):
+    def __init__(self, in_channels=3, out_channels=1, scale_factor=1):
+        super(AttentionDenseUNet, self).__init__()
+        filters = np.array([64, 128, 256, 512, 1024])
+        filters = filters // scale_factor
+        self.n_channels = in_channels
+        self.n_classes = out_channels
+        self.scale_factor = scale_factor
+        self.Maxpool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.Conv1 = DenseConvBlock(ch_in=in_channels, ch_out=filters[0])
+        self.Conv2 = DenseConvBlock(ch_in=filters[0], ch_out=filters[1])
+        self.Conv3 = DenseConvBlock(ch_in=filters[1], ch_out=filters[2])
+        self.Conv4 = DenseConvBlock(ch_in=filters[2], ch_out=filters[3])
+        self.Conv5 = DenseConvBlock(ch_in=filters[3], ch_out=filters[4])
+
+        self.Up5 = up_conv(ch_in=filters[4], ch_out=filters[3])
+        self.Att5 = Attention_block(F_g=filters[3], F_l=filters[3], F_int=filters[2])
+        self.Up_conv5 = DenseConvBlock(ch_in=filters[4], ch_out=filters[3])
+
+        self.Up4 = up_conv(ch_in=filters[3], ch_out=filters[2])
+        self.Att4 = Attention_block(F_g=filters[2], F_l=filters[2], F_int=filters[1])
+        self.Up_conv4 = DenseConvBlock(ch_in=filters[3], ch_out=filters[2])
+
+        self.Up3 = up_conv(ch_in=filters[2], ch_out=filters[1])
+        self.Att3 = Attention_block(F_g=filters[1], F_l=filters[1], F_int=filters[0])
+        self.Up_conv3 = DenseConvBlock(ch_in=filters[2], ch_out=filters[1])
+
+        self.Up2 = up_conv(ch_in=filters[1], ch_out=filters[0])
+        self.Att2 = Attention_block(F_g=filters[0], F_l=filters[0], F_int=filters[0] // 2)
+        self.Up_conv2 = DenseConvBlock(ch_in=filters[1], ch_out=filters[0])
+
+        self.Conv_1x1 = nn.Conv2d(filters[0], out_channels, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        # encoding path
+        x1 = self.Conv1(x)
+
+        x2 = self.Maxpool(x1)
+        x2 = self.Conv2(x2)
+
+        x3 = self.Maxpool(x2)
+        x3 = self.Conv3(x3)
+
+        x4 = self.Maxpool(x3)
+        x4 = self.Conv4(x4)
+
+        x5 = self.Maxpool(x4)
+        x5 = self.Conv5(x5)
+
+        # decoding + concat path
+        d5 = self.Up5(x5)
+        x4 = self.Att5(g=d5, x=x4)
+        d5 = torch.cat((x4, d5), dim=1)
+        d5 = self.Up_conv5(d5)
+
+        d4 = self.Up4(d5)
+        x3 = self.Att4(g=d4, x=x3)
+        d4 = torch.cat((x3, d4), dim=1)
+        d4 = self.Up_conv4(d4)
+
+        d3 = self.Up3(d4)
+        x2 = self.Att3(g=d3, x=x2)
+        d3 = torch.cat((x2, d3), dim=1)
+        d3 = self.Up_conv3(d3)
+
+        d2 = self.Up2(d3)
+        x1 = self.Att2(g=d2, x=x1)
+        d2 = torch.cat((x1, d2), dim=1)
+        d2 = self.Up_conv2(d2)
+
+        d1 = self.Conv_1x1(d2)
+
+        return d1
+
+# Metrics
+def dice_score(pred: torch.Tensor, mask: torch.Tensor, eps=1e-7):
+    pred = torch.sigmoid(pred) > 0.5
+    pred = pred.float()
+    
+    intersection = (pred * mask).sum()
+    union = pred.sum() + mask.sum()
+
+    dice = (2 * intersection + eps) / (union + eps)
+    return dice.item()
+
+
+def iou(pred, target, threshold=0.5):
+    pred = (pred > threshold).float()
+    intersection = (pred * target).sum().item()
+    union = pred.sum().item() + target.sum().item() - intersection
+    return intersection / union if union != 0 else 0.0
+
+def pixel_accuracy(pred, target, threshold=0.5):
+    pred = (pred > threshold).float()
+    correct = (pred == target).sum().item()
+    total = target.numel()
+    return correct / total
+
+# Train
+def plot_pred_img(samples, pred):
+    fig, (ax1, ax2, ax3) = plt.subplots(nrows=3, ncols=1, figsize=(12, 6))
+    fig.tight_layout()
+
+
+    ax1.axis('off')
+    ax1.set_title('input image')
+    ax1.imshow(np.transpose(vutils.make_grid(samples['img'], padding=2).numpy(),
+                           (1, 2, 0)))
+
+    ax2.axis('off')
+    ax2.set_title('input mask')
+    ax2.imshow(np.transpose(vutils.make_grid(samples['mask'], padding=2).numpy(),
+                           (1, 2, 0)), cmap='gray')
+    
+    ax3.axis('off')
+    ax3.set_title('predicted mask')
+    ax3.imshow(np.transpose(vutils.make_grid(pred, padding=2).cpu().numpy(),
+                           (1, 2, 0)), cmap='gray')
+
+    plt.show()
+    
+    
+def plot_train_progress(model):
+#     model.eval()
+
+#     with torch.no_grad():
+    samples = next(iter(val_dataset_loader))
+    val_img = samples['img'].to(device)
+    val_mask = samples['mask'].to(device)
+
+    pred = model(val_img)
+
+
+    plot_pred_img(samples, pred.detach())
+
+#Loss
+import torch
+import torch.nn as nn
+
+class LevelSetLoss(nn.Module):
+    def __init__(self):
+        super(LevelSetLoss, self).__init__()
+
+    def forward(self, pred, target):
+        diff = pred - target
+        squared_diff = diff * diff
+        loss = torch.mean(squared_diff)
+        return loss
+
+#Training
+def train(model, optimizer, criterion, scheduler=None):
+    train_losses = []
+    val_losses = []
+    lr_rates = []
+    min_val_loss = float('inf')
+    # 初始化一个空的DataFrame
+    columns = ['Epoch', 'Batch', 'Dice Score', 'IoU', 'Pixel Accuracy', 'Train Loss', 'Val Loss', 'Learning Rate']
+    results_df = pd.DataFrame(columns=columns)
+    
+    for epoch in range(epochs):
+        model.train()
+        train_total_loss = 0
+        train_iterations = 0
+        
+        for idx, data in enumerate(tqdm(train_dataset_loader)):
+            train_iterations += 1
+            train_img = data['img'].to(device)
+            train_mask = data['mask'].to(device)
+            
+            optimizer.zero_grad()
+            with torch.autocast(device_type='cuda'):
+                train_output_mask = model(train_img)
+                train_loss = criterion(train_output_mask, train_mask)
+                train_total_loss += train_loss.item()
+
+            train_loss.backward()
+            optimizer.step()
+
+        train_epoch_loss = train_total_loss / train_iterations
+        train_losses.append(train_epoch_loss)
+        
+        model.eval()
+        with torch.no_grad():
+            val_total_loss = 0
+            val_iterations = 0
+            scores = 0
+            iou_scores = 0
+            pixel_acc_scores = 0
+            threshold = 0.5
+            for vidx, val_data in enumerate(tqdm(val_dataset_loader)):
+                val_iterations += 1
+                val_img = val_data['img'].to(device)
+                val_mask = val_data['mask'].to(device)
+
+                with torch.autocast(device_type='cuda'):
+                    pred = model(val_img)
+                    binary_output = (pred > threshold).float()
+                    val_loss = criterion(pred, val_mask)
+                    val_total_loss += val_loss.item()
+                    scores += dice_score(binary_output, val_mask)
+                    iou_scores += iou(pred, val_mask)
+                    pixel_acc_scores += pixel_accuracy(pred, val_mask)
+
+            val_epoch_loss = val_total_loss / val_iterations
+            dice_coef_score = scores / val_iterations
+            iou_score = iou_scores / val_iterations
+            pixel_acc_score = pixel_acc_scores / val_iterations
+            val_losses.append(val_epoch_loss)
+
+            plot_train_progress(model)
+            print('Epoch {}/{} [{}/{}], Dice Score: {:.4f}, IoU: {:.4f}, Pixel Accuracy: {:.4f}, Train Loss: {:.4f}, Val Loss: {:.4f}'.format(
+                epoch+1, epochs,
+                idx+1, len(train_dataset_loader),
+                dice_coef_score, iou_score, pixel_acc_score, train_epoch_loss, val_epoch_loss
+            ))
+
+            # 将评价指标添加到DataFrame中
+            result_data = {
+                'Epoch': epoch + 1,
+                'Batch': idx + 1,
+                'Dice Score': dice_coef_score,
+                'IoU': iou_score,
+                'Pixel Accuracy': pixel_acc_score,
+                'Train Loss': train_epoch_loss,
+                'Val Loss': val_epoch_loss,
+                'Learning Rate': optimizer.param_groups[0]['lr']
+            }
+            results_df = results_df.append(result_data, ignore_index=True)
+
+            # 打印整个DataFrame
+            print(results_df)
+            
+        lr_rates.append(optimizer.param_groups[0]['lr'])
+        if scheduler:
+            scheduler.step()  # decay learning rate
+            print('LR rate:', scheduler.get_last_lr())
+
+    return {
+        'lr': lr_rates,
+        'train_loss': train_losses,
+        'valid_loss': val_losses
+    }
+
+#staring training
+import time
+model = AttentionDenseUNet(in_channels=3, out_channels=1).to(device)
+criterion =  LevelSetLoss()
+
+# criterion = smp.losses.DiceLoss(mode='binary')
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+# try to find the best learning rate
+scheduler = StepLR(optimizer, step_size=2, gamma=0.1)
+# 记录训练开始时间戳
+start_time = time.time()
+history2 = train(model, optimizer, criterion, scheduler)
+# 记录训练结束时间戳
+end_time = time.time()
+# 计算训练所需时间
+elapsed_time = end_time - start_time
+print("Total training time: {:.2f} seconds".format(elapsed_time))
+
+#visualize result
+plt.plot(history['train_loss'], label='constant LR train loss')
+plt.plot(history['valid_loss'], label='constant LR val loss')
+
+plt.plot(history2['train_loss'], label='schdule LR train loss')
+plt.plot(history2['valid_loss'], label='schdule LR val loss')
+
+plt.xlabel('epoch')
+plt.ylabel('loss')
+plt.legend()
+plt.show()
+       
+ 
